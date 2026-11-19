@@ -1,0 +1,129 @@
+name: macOS RDP via macrdp + bore
+
+on:
+  workflow_dispatch:
+    inputs:
+      rdp_username:
+        description: 'RDP username'
+        required: true
+        default: 'admin'
+      rdp_password:
+        description: 'RDP password'
+        required: true
+        default: 'admin123'
+
+jobs:
+  rdp:
+    runs-on: macos-14
+    timeout-minutes: 360
+
+    steps:
+      # ---------------------------------------------------------------
+      # 0. Fix Xcode toolchain
+      # ---------------------------------------------------------------
+      - name: Ensure Xcode Command Line Tools are installed
+        run: |
+          sudo xcode-select --install 2>/dev/null || true
+          sleep 10
+
+      - name: Select Xcode developer directory
+        run: |
+          sudo xcode-select --switch /Applications/Xcode.app/Contents/Developer
+          echo "Developer dir: $(xcode-select -p)"
+          clang --version
+          xcrun --find clang
+
+      # ---------------------------------------------------------------
+      # 1. Install Rust
+      # ---------------------------------------------------------------
+      - name: Install Rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+          source "$HOME/.cargo/env"
+          rustc --version
+          cargo --version
+
+      # ---------------------------------------------------------------
+      # 2. Clone and build macrdp
+      # ---------------------------------------------------------------
+      - name: Clone and build macrdp
+        run: |
+          source "$HOME/.cargo/env"
+          export SDKROOT=$(xcrun --show-sdk-path)
+          git clone https://github.com/x6nux/macrdp.git /tmp/macrdp
+          cd /tmp/macrdp
+          cargo build --release --bin macrdp-server
+          ls -lh target/release/macrdp-server
+
+      # ---------------------------------------------------------------
+      # 3. Create macrdp config
+      # ---------------------------------------------------------------
+      - name: Create macrdp config
+        run: |
+          mkdir -p ~/.config/macrdp
+          cat > ~/.config/macrdp/config.toml <<EOF
+          port = 3389
+          username = "${{ github.event.inputs.rdp_username }}"
+          password = "${{ github.event.inputs.rdp_password }}"
+          width = 0
+          height = 0
+          frame_rate = 30
+          hidpi_scale = 1
+          quality = "balanced"
+          encoder = "software"
+          chroma_mode = "avc420"
+          bitrate_mbps = 20
+          log_level = "info"
+          EOF
+          cat ~/.config/macrdp/config.toml
+
+      # ---------------------------------------------------------------
+      # 4. Start macrdp in background
+      # ---------------------------------------------------------------
+      - name: Start macrdp server
+        run: |
+          cd /tmp/macrdp
+          nohup ./target/release/macrdp-server > /tmp/macrdp.log 2>&1 &
+          sleep 10
+          echo "==== macrdp log ===="
+          cat /tmp/macrdp.log
+          echo "==== Checking port 3389 ===="
+          sudo lsof -nP -iTCP:3389 -sTCP:LISTEN || echo "NOT LISTENING on 3389"
+
+      # ---------------------------------------------------------------
+      # 5. Install bore (TCP tunnel)
+      # ---------------------------------------------------------------
+      - name: Install bore
+        run: |
+          curl -L -o /tmp/bore.tar.gz \
+            https://github.com/ekzhang/bore/releases/download/v0.6.0/bore-v0.6.0-aarch64-apple-darwin.tar.gz
+          tar -xzf /tmp/bore.tar.gz -C /tmp
+          sudo mv /tmp/bore /usr/local/bin/bore
+          chmod +x /usr/local/bin/bore
+          bore --version
+
+      # ---------------------------------------------------------------
+      # 6. Open a public TCP tunnel to port 3389
+      # ---------------------------------------------------------------
+      - name: Start bore tunnel
+        run: |
+          nohup bore local 3389 --to bore.pub > /tmp/bore.log 2>&1 &
+          for i in {1..15}; do
+            sleep 2
+            if grep -q "bore.pub:" /tmp/bore.log; then
+              break
+            fi
+          done
+          echo "========== RAW bore log =========="
+          cat /tmp/bore.log
+          echo "===================================="
+          echo ">>> YOUR RDP ENDPOINT <<<"
+          grep -o 'bore.pub:[0-9]*' /tmp/bore.log | head -1 || echo "(no endpoint – see log above)"
+
+      # ---------------------------------------------------------------
+      # 7. Keep the job alive
+      # ---------------------------------------------------------------
+      - name: Keep alive
+        run: |
+          echo "Job will stay alive ~6 hours. Cancel from the Actions UI when done."
+          sleep 21600
